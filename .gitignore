@@ -1,0 +1,10 @@
+target/
+.idea/
+*.iml
+uploads/
+logs/
+.DS_Store
+backend.log
+.token
+.utoken
+testout/

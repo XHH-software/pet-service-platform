@@ -1,0 +1,57 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: pet-service-platform
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/pet_service_platform?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: root
+  redis:
+    host: localhost
+    port: 6379
+    database: 0
+    timeout: 3000ms
+  servlet:
+    multipart:
+      max-file-size: 2MB
+      max-request-size: 5MB
+  jackson:
+    time-zone: Asia/Shanghai
+    default-property-inclusion: always
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
+app:
+  jwt:
+    secret: pet-rvice-platform-jwt-secret-kseey-2026-please-change-in-production
+    expire-days: 7
+  upload:
+    type: local
+    dir: ./uploads
+    base-url: http://localhost:8080
+    oss:
+      endpoint: oss-cn-beijing.aliyuncs.com
+      bucket: pet-service-platform
+      access-key-id: ""
+      access-key-secret: ""
+  wx:
+    app-id: ""
+    app-secret: ""
+    mock: true
+  order:
+    timeout-minutes: 30
+
+logging:
+  level:
+    root: info
+    com.pet.platform: info
