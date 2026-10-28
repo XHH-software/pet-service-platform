@@ -1,18 +1,18 @@
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
 
 spring:
   application:
     name: pet-service-platform
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://localhost:3306/pet_service_platform?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
-    username: root
-    password: root
+    url: "${DB_URL:jdbc:mysql://localhost:3306/pet_service_platform?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true}"
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:root}
   redis:
-    host: localhost
-    port: 6379
-    database: 0
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    database: ${REDIS_DATABASE:0}
     timeout: 3000ms
   servlet:
     multipart:
@@ -33,23 +33,24 @@ mybatis-plus:
 
 app:
   jwt:
-    secret: pet-rvice-platform-jwt-secret-kseey-2026-please-change-in-production
-    expire-days: 7
+    # 生产环境请通过环境变量 JWT_SECRET 覆盖，避免使用仓库中的默认值
+    secret: ${JWT_SECRET:pet-rvice-platform-jwt-secret-kseey-2026-please-change-in-production}
+    expire-days: ${JWT_EXPIRE_DAYS:7}
   upload:
-    type: local
-    dir: ./uploads
-    base-url: http://localhost:8080
+    type: ${UPLOAD_TYPE:local}
+    dir: ${UPLOAD_DIR:./uploads}
+    base-url: ${UPLOAD_BASE_URL:http://localhost:8080}
     oss:
-      endpoint: oss-cn-beijing.aliyuncs.com
-      bucket: pet-service-platform
-      access-key-id: ""
-      access-key-secret: ""
+      endpoint: ${OSS_ENDPOINT:oss-cn-beijing.aliyuncs.com}
+      bucket: ${OSS_BUCKET:pet-service-platform}
+      access-key-id: ${OSS_ACCESS_KEY_ID:}
+      access-key-secret: ${OSS_ACCESS_KEY_SECRET:}
   wx:
-    app-id: ""
-    app-secret: ""
-    mock: true
+    app-id: ${WX_APP_ID:}
+    app-secret: ${WX_APP_SECRET:}
+    mock: ${WX_MOCK:true}
   order:
-    timeout-minutes: 30
+    timeout-minutes: ${ORDER_TIMEOUT_MINUTES:30}
 
 logging:
   level:
