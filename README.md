@@ -3,7 +3,7 @@
 宠物服务预约平台后端（Spring Boot + MyBatis-Plus + MySQL + Redis + JWT），同时为两个真实前端提供接口：
 
 - 商家管理端：[pet-web-admin-kit](https://github.com/XHH-software/pet-web-admin-kit)（Vue 3 + Element Plus + Vite，默认 8081）
-- 小程序端：[pet-wx-users-kit](https://github.com/XHH-software/pet-wx-users-kit)（uni-app，H5 调试默认 8082）
+- 小程序端：[pet-wx-users-kit](https://github.com/XHH-software/pet-wx-users-kit)（uni-app，H5 调试常用 8082）
 
 后端按前端现有调用契约实现，不是空壳或 mock 数据，所有列表、详情、下单、支付、核销、排班、CRUD、上传接口均可直接联调。
 
@@ -88,7 +88,7 @@ npm run dev            # http://localhost:8081
 # 小程序 H5
 cd D:\pet-wx-users-kit
 npm install
-npm run dev:h5         # http://localhost:8082
+npm run dev:h5 -- --port 8082   # http://localhost:8082（不加参数时默认 5173）
 ```
 
 - 管理端 `VITE_API_BASE=/api`，Vite 代理到 `http://localhost:8080` 并去掉 `/api`。
