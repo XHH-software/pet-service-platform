@@ -324,19 +324,3 @@ curl -s -X POST http://localhost:8080/user/login \
 # 未登录应返回 code=401
 curl -s http://localhost:8080/user/pet/list
 ```
-
----
-
-## 11. 与简历描述的对应关系
-
-| 简历能力 | 本项目实际实现 |
-| --- | --- |
-| 双端 JWT + 独立拦截器 + ThreadLocal 清理 | ✅ 已实现 |
-| 自定义注解 + AOP 公共字段填充 | ✅ `@AutoFill` + `AutoFillAspect` |
-| Redis ZSet 订单超时关闭 + 扫表兜底 | ✅ 已实现（30 分钟，30s ZSet + 5min 扫表） |
-| 乐观锁防超卖 | ⚠️ 实际是 `schedule.booked_count` 的 version 乐观锁 + 时段冲突校验，不是商品库存 |
-| 购物车 / 订单明细 / 清购物车 | ❌ 预约业务没有购物车；订单明细为 `appointment_item`（服务项目快照） |
-
-建议简历措辞改为：
-
-> 基于 Spring Boot + MyBatis-Plus + Redis 实现宠物服务预约平台后端，设计双端 JWT 鉴权与独立拦截器，使用 ThreadLocal 传递登录态并在请求结束清理；通过自定义注解 + AOP 统一填充公共字段；预约下单时校验员工时段冲突，并用 `schedule.booked_count` 的 version 乐观锁控制并发；基于 Redis ZSet 实现待支付订单 30 分钟超时关闭，配合定时扫表兜底。
