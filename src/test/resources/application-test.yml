@@ -1,0 +1,48 @@
+# 集成测试配置：H2 内存库 + 不可用的 Redis 地址
+#
+# Redis 故意指向 127.0.0.1:1（必然拒绝连接），这样「Redis 故障不影响下单主流程」
+# 这条降级逻辑每天都被 CI 真实跑一遍，而不是靠 mock 假装。
+spring:
+  datasource:
+    driver-class-name: org.h2.Driver
+    # LOCK_TIMEOUT：并发用例里 16 个线程同时写同一张表，H2 默认等锁 1 秒会直接抛 50200，
+    # 这里放宽到 15 秒；MySQL/InnoDB 的行锁行为不依赖该参数。
+    url: jdbc:h2:mem:pet_service_test;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=15000
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema-h2.sql
+  redis:
+    host: 127.0.0.1
+    port: 1
+    timeout: 500ms
+  jackson:
+    time-zone: Asia/Shanghai
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
+app:
+  jwt:
+    secret: integration-test-secret-key-not-for-production-use
+    expire-days: 7
+  upload:
+    type: local
+    dir: ./target/test-uploads
+    base-url: http://localhost:8080
+  wx:
+    mock: true
+  order:
+    timeout-minutes: 30
+
+logging:
+  level:
+    root: warn
+    com.pet.platform: info
