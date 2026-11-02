@@ -96,7 +96,7 @@ pet-service-platform/
 │     ├─ schedule, appointment, review
 │     ├─ shop, dashboard, upload
 ├─ src/test/
-│  ├─ java/com/pet/platform/      # 14 个集成测试（并发 / 限量 / 降级 / 越权）
+│  ├─ java/com/pet/platform/      # 24 个集成测试（并发 / 限量 / 排班校验 / 降级 / 越权）
 │  └─ resources/
 │     ├─ application-test.yml     # H2 内存库 + 故意不可用的 Redis
 │     └─ schema-h2.sql            # 与生产 DDL 同构的 H2 版本
@@ -292,18 +292,20 @@ npm run dev:h5 -- --port 8082   # http://localhost:8082（不加参数时默认 
 - `AutoFillAspect` 环绕通知扫描方法参数中的 `BaseEntity`，统一填充 `createTime/updateTime/createBy/updateBy`，`createBy/updateBy` 取自 `UserContext`。
 - `BaseEntity` 作为所有业务实体父类，避免每个 Service 手写重复赋值。
 
-### 7.3 预约时段冲突 + `schedule.booked_count` 乐观锁
+### 7.3 预约时段冲突 + `schedule.booked_count` 原子自增
 
 - 下单时按 `staffId + date + 时间段` 查询 `appointment_slot`，存在重叠即拒绝，提示“该时段已被预约，请选择其他时间”。
-- 排班表 `schedule` 有 `version` 字段，`booked_count` 通过以下 SQL 更新：
+- 真正的正确性来自 `appointment_slot` 上的唯一索引，前面的查询只负责给出友好提示。
+- 排班表的已约数用**单条原子自增**更新：
 
   ```sql
   update schedule
      set booked_count = booked_count + 1, version = version + 1, update_time = now()
-   where id = #{id} and version = #{version}
+   where id = #{id}
   ```
 
-  更新影响行数为 0 时重试，重试仍失败则回滚下单，防止并发下超卖时段。
+  这里刻意不带 `version` 条件。早先的写法是“读 `version` → 带 `version` 更新 → 失败重试”，但在 MySQL 默认的 `REPEATABLE_READ` 下，同一事务内的一致性读共用首次快照，重试读到的仍是旧 `version`，5 次重试必然全败，`booked_count` 静默少记（8 单只记 1 单）。`booked_count = booked_count + 1` 本身由 InnoDB 行锁保证原子，不需要乐观锁。
+- `booked_count` 只服务排班周视图展示；能不能约以 `appointment_slot` 为准，所以它出问题不会导致超卖。
 
 ### 7.4 Redis ZSet 订单超时关闭 + 扫表兜底
 
@@ -314,7 +316,8 @@ npm run dev:h5 -- --port 8082   # http://localhost:8082（不加参数时默认 
 
 ### 7.5 订单号与状态
 
-- 订单号格式：`AP + yyyyMMdd + 4 位当日序号`，例如 `AP202610280001`。
+- 订单号格式：`AP + yyyyMMdd + 6 位自增主键`，例如 `AP20261028000137`。**由主键派生，插入后在同一事务里回填**（`order_no` 因此允许为空），唯一性由主键天然保证。
+  早先的做法是“查当天最大号 + 1”，属于读-改-写：并发下多个事务读到同一个号，只能靠唯一索引冲突后重试，而重试时其他事务同样未提交，于是连续冲突——8 个并发下单会有 5 个被拒。现在不存在任何竞态，也不需要重试。
 - 状态：`1 待支付`、`2 待服务`、`3 服务中`、`4 已取消`、`5 已完成`、`6 已评价`（与两端前端 `APPOINTMENT_STATUS` 完全一致）。
 - 管理端代下单初始 `status=2`、`source=2`；小程序下单初始 `status=1`、`source=1`。
 
@@ -355,24 +358,25 @@ CREATE TABLE service_daily_quota (
 
 `daily_limit = 0` 或 `NULL` 视为不限量，直接跳过令牌写入。
 
-### 7.8 订单号在并发下的唯一性
+### 7.8 订单号：从「读最大号 + 1」改成「按主键派生」
 
-`OrderNoService.next()` 是「查当天最大号 + 1」，即使加了 `synchronized` 也只能保证同一 JVM 内串行——**前一个事务还没提交时，后一个线程查不到它刚插入的行**，于是生成同一个号，撞上 `order_no` 的唯一索引。
+这一节记录了三版实现，因为它是一个很典型的「看起来能跑，并发下必崩」的例子。
 
-处理方式不是把异常抛给用户，而是在写库处做「重取号 + 重试」（`AppointmentService#insertAppointment`）：
+**第一版：`synchronized` + 查当天最大号 + 1。** 单机内串行，看似安全。但锁只护住了「读号 + 插入」这一小段，事务提交在锁外——**前一个事务还没提交时，后一个线程查不到它刚插入的行**，于是生成同一个号，撞上 `order_no` 唯一索引。
+
+**第二版：冲突后重取号重试 3 次。** 把 `DuplicateKeyException` 从「抛给用户」改成「换个号再试」。但重试时其他并发事务同样没提交，读到的最大号还是同一个，于是又撞。压测结果：**8 个互不冲突的时段并发下单，5 个报「下单人数较多」**——不是时段冲突，全是订单号冲突。这个用例现在还留在 `AppointmentConcurrencyTest` 里。
+
+**最终版：订单号由自增主键派生，插入后在同一事务里回填。**
 
 ```java
-for (int attempt = 1; ; attempt++) {
-    try { appointmentMapper.insert(appointment); return; }
-    catch (DuplicateKeyException e) {          // appointment 表上只有 order_no 一个唯一键
-        if (attempt >= 3) throw new BusinessException("下单人数较多，请稍后重试");
-        appointment.setId(null);
-        appointment.setOrderNo(orderNoService.next(appointment.getAppointmentDate()));
-    }
-}
+appointmentMapper.insert(appointment);                    // order_no 暂为 NULL
+String orderNo = OrderNo.of(date, appointment.getId());   // AP + yyyyMMdd + 6 位 id
+appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
+        .set(Appointment::getOrderNo, orderNo)
+        .eq(Appointment::getId, appointment.getId()));
 ```
 
-代价是极端并发下订单号可能不连续（`...0003` 后面直接 `...0005`），这在预约单场景可以接受。
+唯一性由主键天然保证，**不存在竞态，也就不需要重试**。代价有两条，都写进已知边界：`order_no` 列允许为空（只在同一事务的两条语句之间为空，提交前一定回填）；号段是全局自增、跨天连续，不再每天从 `0001` 开始。
 
 ---
 
@@ -387,6 +391,8 @@ for (int attempt = 1; ; attempt++) {
 | Redis 只做加速，不做事实来源 | 缓存一定会挂；订单是钱，不能因为缓存挂了就下不了单 | 缓存不可用时关单会延迟最多 5 分钟（扫表周期） |
 | 管理端与小程序各一套 token 与拦截器 | 一个 token 走天下时，用户 token 能直接调管理端接口 | 多一个 `type` 字段的校验成本 |
 | 名额用令牌表而不是计数器 | 令牌与订单同事务，天然不会漂移 | 多一张表，取消时要显式回收 |
+| 订单号由自增主键派生，而不是读当天最大号 | 读-改-写在并发下必然取到重号，重试也救不回来 | `order_no` 允许为空（事务内短暂），号段跨天连续 |
+| 已约数用 `booked_count = booked_count + 1` | 自增本身原子，不需要乐观锁；带 `version` 重试在 RR 下是空转 | 无法感知“这一行被谁改过”，但该字段只用于展示 |
 | 集成测试用 H2 而不是 Testcontainers | clone 下来 `mvn test` 就能跑，不需要装 Docker | H2 与 MySQL 有方言差异，需要单独维护一份同构 DDL |
 
 ---
@@ -394,7 +400,7 @@ for (int attempt = 1; ; attempt++) {
 ## 9. 测试与验证
 
 ```bash
-mvn test        # 14 个用例，约 30 秒，不依赖 Docker / MySQL / Redis
+mvn test        # 24 个用例，约 40 秒，不依赖 Docker / MySQL / Redis
 ```
 
 测试直接跑真实 Spring 容器 + 真实 MyBatis-Plus + H2(MODE=MySQL)，**不 mock Mapper**——要验证的正是数据库约束本身。`application-test.yml` 里 Redis 被故意指向 `127.0.0.1:1`，所以每个用例都在「缓存不可用」的真实降级路径上运行。
@@ -405,6 +411,7 @@ mvn test        # 14 个用例，约 30 秒，不依赖 Docker / MySQL / Redis
 | | `adjacentSlotStaysAvailableAfterBooking` | 10:00 被占后 10:30 仍可下单，切片之间不误伤 |
 | | `longServiceBlocksEverySlotItCovers` | 60 分钟服务会把 10:30 这个起点一起占掉 |
 | | `cancelReleasesSlots` | 取消后时间片释放，同一时段可被重新预订 |
+| | `bookedCountStaysAccurateForConcurrentDifferentSlots` | 8 个线程并发下**互不冲突的 8 个时段全部成交**，`booked_count` 恰好等于 8（钉住“已约数不能用读-改-写更新”） |
 | `AppointmentDailyLimitTest` | `rejectsTheFourthBookingAndAcceptsAfterCancel` | 限额 3 的项目第 4 单被拒；取消一单后名额回收、可以再约 |
 | | `concurrentBookingsNeverExceedDailyLimit` | 8 个并发抢 3 个名额，**恰好成交 3 单**，不多不少 |
 | | `unlimitedServiceIsNotCapped` | `daily_limit=0` 不受限，且不写令牌行 |
@@ -415,6 +422,11 @@ mvn test        # 14 个用例，约 30 秒，不依赖 Docker / MySQL / Redis
 | | `missingTokenIsRejectedAndValidTokenPasses` | 无 token 拒绝、正确 token 放行 |
 | | `bearerHeaderIsAlsoAccepted` | `Authorization: Bearer` 兼容 |
 | | `tamperedTokenIsRejected` | 篡改签名 / 乱写 token 一律 401 |
+| `ScheduleValidationTest` | `batchRejectsReversedRange` / `batchRejectsNullTime` | 批量排班原来不校验时间，能写进 `start >= end` 的排班；现在被拒绝且不落库 |
+| | `batchRejectsTooShortRange` / `batchRejectsTooLongSpan` | 不足 30 分钟排不出任何可约时段；跨度上限 90 天，防止误传年份把库写爆 |
+| | `deleteRejectedWhenDayHasBookings` / `deleteWorksWhenDayIsFree` | 当天已有预约时拒绝删排班（否则留下“预约还在、排班没了”的孤儿单）；空闲时可正常删 |
+| | `updateRejectsShrinkingBelowBookedSlot` / `updateAllowsWideningRange` | 时间区间不能缩到已预约时段之外，放大则允许 |
+| | `copySkipsInvalidSourceRows` | 复制上周排班时跳过历史脏数据，不因为一条坏记录阻断整周 |
 
 ---
 
@@ -434,6 +446,7 @@ app.upload.dir: ./uploads
 app.upload.base-url: http://localhost:8080
 app.wx.mock: true              # 开发期微信登录 mock
 app.order.timeout-minutes: 30
+app.cors.allowed-origins: '*'  # 逗号分隔的来源白名单，* 表示不限制
 ```
 
 切换到 OSS：把 `app.upload.type` 改为 `oss`，并填写 `app.upload.oss.*` 的 endpoint/bucket/AK/SK。
@@ -450,12 +463,13 @@ app.order.timeout-minutes: 30
 | `UPLOAD_TYPE` / `UPLOAD_DIR` | `local` / `./uploads` | 存储方式与目录 |
 | `WX_MOCK` | `true` | 关掉才会走真实微信登录 |
 | `ORDER_TIMEOUT_MINUTES` | `30` | 未支付自动关单时长 |
+| `CORS_ALLOWED_ORIGINS` | `*` | 允许的跨域来源，逗号分隔；生产建议填具体域名 |
 
 ---
 
 ## 11. 已知边界（如实说明）
 
-1. **没有购物车、没有商品库存扣减**。本项目是“服务预约”业务，不是电商；核心并发控制是“时段冲突校验 + `schedule.booked_count` 乐观锁 + 名额令牌”，不是商品库存防超卖。
+1. **没有购物车、没有商品库存扣减**。本项目是“服务预约”业务，不是电商；核心并发控制是“时段冲突校验 + 唯一索引兜底 + 名额令牌”，不是商品库存防超卖。
 2. **微信登录是开发期 mock**。`app.wx.mock=true` 时任意 code 都映射到 `mock_openid_dev`（张女士）。**部署到公网前必须配置 `app.wx.app-id/app-secret` 并把 `WX_MOCK` 设为 false，同时替换 `JWT_SECRET`**——否则任何人都能登进演示账号。
 3. **支付是演示实现**。`/user/appointment/{id}/pay` 直接把订单置为已支付，未接微信支付。
 4. **单门店**。`shop` 表只有一条记录，未做多租户/多门店隔离。
@@ -463,7 +477,7 @@ app.order.timeout-minutes: 30
 6. **每日名额只对下单生效**。启动器播种的历史订单是直接 insert 的，不会写入名额令牌，因此演示数据里“今天的已约数”不占当日名额。
 7. **疫苗过期拦截**。演示数据中 `雪球` 疫苗已过期，下单会被拒绝，这是预期业务校验。
 8. **上传文件保存在本地 `./uploads`**，通过 `/uploads/**` 静态访问；生产建议切 OSS 或对象存储。
-9. **订单号在极端并发下可能不连续**（靠重试换来唯一性，见 7.8）。
+9. **订单号是“日期 + 自增主键”，号段跨天连续**，不再是每天从 0001 开始（换来的是零竞态，见 7.5）。
 10. 管理端列表手机号脱敏（`138****1234`），详情接口返回完整号码。
 
 ---
