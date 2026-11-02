@@ -9,9 +9,11 @@ import com.pet.platform.common.PageResult;
 import com.pet.platform.module.appointment.entity.Appointment;
 import com.pet.platform.module.appointment.entity.AppointmentItem;
 import com.pet.platform.module.appointment.entity.AppointmentSlot;
+import com.pet.platform.module.appointment.entity.ServiceDailyQuota;
 import com.pet.platform.module.appointment.mapper.AppointmentItemMapper;
 import com.pet.platform.module.appointment.mapper.AppointmentMapper;
 import com.pet.platform.module.appointment.mapper.AppointmentSlotMapper;
+import com.pet.platform.module.appointment.mapper.ServiceDailyQuotaMapper;
 import com.pet.platform.module.customer.entity.Customer;
 import com.pet.platform.module.customer.entity.Pet;
 import com.pet.platform.module.customer.mapper.CustomerMapper;
@@ -59,11 +61,11 @@ import java.util.stream.Collectors;
 public class AppointmentService {
 
     public static final String TIMEOUT_KEY = "appointment:timeout";
-    private static final LocalTime OPEN = LocalTime.of(0, 0);
 
     private final AppointmentMapper appointmentMapper;
     private final AppointmentItemMapper itemMapper;
     private final AppointmentSlotMapper slotMapper;
+    private final ServiceDailyQuotaMapper quotaMapper;
     private final StaffMapper staffMapper;
     private final StaffSpecialtyMapper staffSpecialtyMapper;
     private final ServiceItemMapper serviceItemMapper;
@@ -316,6 +318,7 @@ public class AppointmentService {
 
         int petSize = petSize(pet.getWeight());
         List<AppointmentItem> items = new ArrayList<>();
+        List<QuotaTarget> quotas = new ArrayList<>();
         int duration;
         BigDecimal amount;
         if (request.getPackageId() != null) {
@@ -333,6 +336,7 @@ public class AppointmentService {
             item.setQuantity(1);
             item.setSubtotal(amount);
             items.add(item);
+            quotas.add(new QuotaTarget(null, pkg.getId(), pkg.getDailyLimit(), pkg.getName()));
         } else {
             List<Long> serviceItemIds = request.getServiceItemIds();
             if (serviceItemIds == null || serviceItemIds.isEmpty()) {
@@ -365,6 +369,8 @@ public class AppointmentService {
                 item.setQuantity(1);
                 item.setSubtotal(serviceItem.getPrice());
                 items.add(item);
+                quotas.add(new QuotaTarget(serviceItem.getId(), null,
+                        serviceItem.getDailyLimit(), serviceItem.getName()));
             }
         }
         if (duration <= 0) {
@@ -422,12 +428,15 @@ public class AppointmentService {
         appointment.setCancelReason(null);
         appointment.setPayTime(null);
         appointment.setOrderNo(orderNoService.next(date));
-        appointmentMapper.insert(appointment);
+        insertAppointment(appointment);
 
         for (AppointmentItem item : items) {
             item.setId(null);
             item.setAppointmentId(appointment.getId());
             itemMapper.insert(item);
+        }
+        for (QuotaTarget quota : quotas) {
+            reserveDailyQuota(quota, date, appointment.getId());
         }
         try {
             for (LocalTime time = start; time.isBefore(end); time = time.plusMinutes(30)) {
@@ -586,12 +595,85 @@ public class AppointmentService {
     private void releaseSlots(Appointment appointment) {
         slotMapper.delete(Wrappers.<AppointmentSlot>lambdaQuery()
                 .eq(AppointmentSlot::getAppointmentId, appointment.getId()));
+        releaseDailyQuota(appointment.getId());
         Schedule schedule = scheduleMapper.selectOne(Wrappers.<Schedule>lambdaQuery()
                 .eq(Schedule::getStaffId, appointment.getStaffId())
                 .eq(Schedule::getScheduleDate, appointment.getAppointmentDate())
                 .last("limit 1"));
         if (schedule != null) {
             changeBooked(schedule.getId(), false);
+        }
+    }
+
+    /**
+     * 写预约主表。order_no 上有唯一索引，并发下 OrderNoService 可能取到同一个号
+     * （它读的是已提交数据，前一个事务还没提交时读不到），这里用"重取号 + 重试"兜住，
+     * 而不是把并发异常抛给用户。
+     */
+    private void insertAppointment(Appointment appointment) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                appointmentMapper.insert(appointment);
+                return;
+            } catch (DuplicateKeyException e) {
+                if (attempt >= 3) {
+                    log.warn("预约号连续冲突 3 次，放弃下单: {}", appointment.getOrderNo());
+                    throw new BusinessException("下单人数较多，请稍后重试");
+                }
+                appointment.setId(null);
+                appointment.setOrderNo(orderNoService.next(appointment.getAppointmentDate()));
+            }
+        }
+    }
+
+    /**
+     * 占用一个当日名额。
+     *
+     * <p>不查 count，直接按 seq=1..limit 逐个尝试插入令牌行：(service_item_id, quota_date, seq)
+     * 上有唯一索引，并发时同一 seq 只会有一个事务成功，其余拿到 DuplicateKeyException 后顺延。
+     * seq 全部被占满 → 当日名额用完。整个过程没有"先查后写"的时间窗。
+     */
+    private void reserveDailyQuota(QuotaTarget target, LocalDate date, Long appointmentId) {
+        Integer limit = target.limit;
+        if (limit == null || limit <= 0) {
+            return; // 0 或空表示不限量
+        }
+        for (int seq = 1; seq <= limit; seq++) {
+            ServiceDailyQuota quota = new ServiceDailyQuota();
+            quota.setQuotaDate(date);
+            quota.setServiceItemId(target.serviceItemId);
+            quota.setPackageId(target.packageId);
+            quota.setSeq(seq);
+            quota.setAppointmentId(appointmentId);
+            try {
+                quotaMapper.insert(quota);
+                return;
+            } catch (DuplicateKeyException occupied) {
+                // 该序号今天已被别人占掉，顺延下一个
+            }
+        }
+        throw new BusinessException("「" + target.name + "」今日名额已满（每日限额 " + limit + " 单）");
+    }
+
+    private void releaseDailyQuota(Long appointmentId) {
+        quotaMapper.delete(Wrappers.<ServiceDailyQuota>lambdaQuery()
+                .eq(ServiceDailyQuota::getAppointmentId, appointmentId));
+    }
+
+    /**
+     * 待占用的名额：一个预约可能包含多个服务项目（或一个套餐）。
+     */
+    private static final class QuotaTarget {
+        private final Long serviceItemId;
+        private final Long packageId;
+        private final Integer limit;
+        private final String name;
+
+        private QuotaTarget(Long serviceItemId, Long packageId, Integer limit, String name) {
+            this.serviceItemId = serviceItemId;
+            this.packageId = packageId;
+            this.limit = limit;
+            this.name = name;
         }
     }
 

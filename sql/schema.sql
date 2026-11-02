@@ -8,6 +8,7 @@ SET FOREIGN_KEY_CHECKS = 0;
 
 DROP TABLE IF EXISTS review;
 DROP TABLE IF EXISTS appointment_slot;
+DROP TABLE IF EXISTS service_daily_quota;
 DROP TABLE IF EXISTS appointment_item;
 DROP TABLE IF EXISTS appointment;
 DROP TABLE IF EXISTS schedule;
@@ -219,6 +220,19 @@ CREATE TABLE appointment_slot (
   UNIQUE KEY uk_staff_date_slot (staff_id, appointment_date, slot_time),
   KEY idx_appointment (appointment_id)
 ) COMMENT '预约占用时间片（30分钟粒度）';
+
+CREATE TABLE service_daily_quota (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  quota_date DATE NOT NULL,
+  service_item_id BIGINT,
+  package_id BIGINT,
+  seq INT NOT NULL COMMENT '当天第几个名额，1..daily_limit',
+  appointment_id BIGINT NOT NULL,
+  create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_item_date_seq (service_item_id, quota_date, seq),
+  UNIQUE KEY uk_package_date_seq (package_id, quota_date, seq),
+  KEY idx_quota_appointment (appointment_id)
+) COMMENT '每日名额令牌：靠唯一索引实现并发限量';
 
 CREATE TABLE review (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
