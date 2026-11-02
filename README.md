@@ -391,7 +391,7 @@ for (int attempt = 1; ; attempt++) {
 ## 9. 测试与验证
 
 ```bash
-mvn test        # 14 个用例，约 25 秒，不依赖 Docker / MySQL / Redis
+mvn test        # 14 个用例，约 30 秒，不依赖 Docker / MySQL / Redis
 ```
 
 测试直接跑真实 Spring 容器 + 真实 MyBatis-Plus + H2(MODE=MySQL)，**不 mock Mapper**——要验证的正是数据库约束本身。`application-test.yml` 里 Redis 被故意指向 `127.0.0.1:1`，所以每个用例都在「缓存不可用」的真实降级路径上运行。
