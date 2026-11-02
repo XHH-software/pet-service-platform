@@ -12,6 +12,7 @@ import com.pet.platform.module.customer.mapper.CustomerMapper;
 import com.pet.platform.module.customer.mapper.PetMapper;
 import com.pet.platform.module.schedule.entity.Schedule;
 import com.pet.platform.module.schedule.mapper.ScheduleMapper;
+import com.pet.platform.module.schedule.service.ScheduleService;
 import com.pet.platform.module.service.entity.ServiceItem;
 import com.pet.platform.module.service.mapper.ServiceItemMapper;
 import com.pet.platform.module.staff.entity.Staff;
@@ -62,6 +63,8 @@ public abstract class BaseIntegrationTest {
     protected ServiceItemMapper serviceItemMapper;
     @Autowired
     protected ScheduleMapper scheduleMapper;
+    @Autowired
+    protected ScheduleService scheduleService;
     @Autowired
     protected AppointmentMapper appointmentMapper;
     @Autowired
