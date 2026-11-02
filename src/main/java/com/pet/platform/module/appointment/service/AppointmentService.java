@@ -75,7 +75,6 @@ public class AppointmentService {
     private final PetMapper petMapper;
     private final CustomerMapper customerMapper;
     private final ReviewMapper reviewMapper;
-    private final OrderNoService orderNoService;
     private final StringRedisTemplate redisTemplate;
 
     @Value("${app.order.timeout-minutes:30}")
@@ -427,8 +426,15 @@ public class AppointmentService {
         appointment.setSource(admin ? 2 : 1);
         appointment.setCancelReason(null);
         appointment.setPayTime(null);
-        appointment.setOrderNo(orderNoService.next(date));
-        insertAppointment(appointment);
+        // order_no 由自增主键派生：先插入拿到 id，再在同一事务里回填，
+        // 不再「读当天最大号 + 1」——那是读-改-写，并发下必然取到同一个号。
+        appointment.setOrderNo(null);
+        appointmentMapper.insert(appointment);
+        String orderNo = OrderNo.of(date, appointment.getId());
+        appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
+                .set(Appointment::getOrderNo, orderNo)
+                .eq(Appointment::getId, appointment.getId()));
+        appointment.setOrderNo(orderNo);
 
         for (AppointmentItem item : items) {
             item.setId(null);
@@ -606,27 +612,6 @@ public class AppointmentService {
     }
 
     /**
-     * 写预约主表。order_no 上有唯一索引，并发下 OrderNoService 可能取到同一个号
-     * （它读的是已提交数据，前一个事务还没提交时读不到），这里用"重取号 + 重试"兜住，
-     * 而不是把并发异常抛给用户。
-     */
-    private void insertAppointment(Appointment appointment) {
-        for (int attempt = 1; ; attempt++) {
-            try {
-                appointmentMapper.insert(appointment);
-                return;
-            } catch (DuplicateKeyException e) {
-                if (attempt >= 3) {
-                    log.warn("预约号连续冲突 3 次，放弃下单: {}", appointment.getOrderNo());
-                    throw new BusinessException("下单人数较多，请稍后重试");
-                }
-                appointment.setId(null);
-                appointment.setOrderNo(orderNoService.next(appointment.getAppointmentDate()));
-            }
-        }
-    }
-
-    /**
      * 占用一个当日名额。
      *
      * <p>不查 count，直接按 seq=1..limit 逐个尝试插入令牌行：(service_item_id, quota_date, seq)
@@ -678,22 +663,21 @@ public class AppointmentService {
     }
 
     /**
-     * 已约数并发更新：version 乐观锁 + 重试，避免计数丢失。
+     * 已约数增减：交给数据库做原子自增，不再走「读 version + 带 version 更新 + 重试」。
+     *
+     * <p>那条路在 MySQL 默认的 REPEATABLE_READ 下是空转的——同一事务里前面已经读过这一行，
+     * 快照就固定了，重试读到的还是旧 version，5 次全败，最后只剩一行 warn，计数静默少记。
+     *
+     * <p>这里的计数只服务于排班周视图展示；能不能约以 appointment_slot 为准，
+     * 所以即便这行更新失败（例如排班被并发删除），也不会造成超卖。
      */
     private void changeBooked(Long scheduleId, boolean increase) {
-        for (int i = 0; i < 5; i++) {
-            Schedule current = scheduleMapper.selectById(scheduleId);
-            if (current == null) {
-                return;
-            }
-            int rows = increase
-                    ? scheduleMapper.increaseBooked(current.getId(), current.getVersion())
-                    : scheduleMapper.decreaseBooked(current.getId(), current.getVersion());
-            if (rows > 0) {
-                return;
-            }
+        int rows = increase
+                ? scheduleMapper.increaseBooked(scheduleId)
+                : scheduleMapper.decreaseBooked(scheduleId);
+        if (rows == 0) {
+            log.warn("排班 {} 不存在或已被删除，已约数未更新", scheduleId);
         }
-        log.warn("排班 {} 已约数更新失败（乐观锁重试 5 次）", scheduleId);
     }
 
     private boolean isFree(LocalTime start, int duration, Set<LocalTime> booked) {

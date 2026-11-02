@@ -173,7 +173,9 @@ CREATE TABLE customer_address (
 
 CREATE TABLE appointment (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  order_no VARCHAR(20) NOT NULL UNIQUE,
+  -- 允许为空：订单号由自增主键派生，插入后在同一事务内回填。
+  -- 想做到「插入前就知道号」只能读当天最大号，那是读-改-写，并发下必然撞唯一键。
+  order_no VARCHAR(20) NULL UNIQUE,
   customer_id BIGINT NOT NULL,
   pet_id BIGINT NOT NULL,
   staff_id BIGINT NOT NULL,

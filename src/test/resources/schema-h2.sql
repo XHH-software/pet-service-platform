@@ -161,7 +161,7 @@ CREATE TABLE customer_address (
 
 CREATE TABLE appointment (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  order_no VARCHAR(20) NOT NULL UNIQUE,
+  order_no VARCHAR(20) NULL UNIQUE,
   customer_id BIGINT NOT NULL,
   pet_id BIGINT NOT NULL,
   staff_id BIGINT NOT NULL,

@@ -88,6 +88,55 @@ class AppointmentConcurrencyTest extends BaseIntegrationTest {
     }
 
     @Test
+    @DisplayName("同一技师并发下不同时段：已约数等于实际成交单数，一个都不丢")
+    void bookedCountStaysAccurateForConcurrentDifferentSlots() throws Exception {
+        Long staffId = seedStaff();
+        Long customerId = seedCustomer();
+        Long petId = seedPet(customerId);
+        Long serviceId = seedService("基础洗护", 30, 100);
+        Long scheduleId = seedSchedule(staffId, LocalTime.of(9, 0), LocalTime.of(18, 0));
+
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch fire = new CountDownLatch(1);
+        List<Future<String>> futures = new ArrayList<>();
+
+        for (int i = 0; i < threads; i++) {
+            LocalTime start = LocalTime.of(9, 0).plusMinutes(30L * i);
+            futures.add(pool.submit(() -> {
+                ready.countDown();
+                fire.await(5, TimeUnit.SECONDS);
+                try {
+                    appointmentService.create(bookingRequest(petId, staffId, serviceId, start), customerId, false);
+                    return "OK";
+                } catch (BusinessException e) {
+                    return "BIZ:" + e.getMessage();
+                } catch (Exception e) {
+                    return "ERR:" + e.getClass().getSimpleName() + ":" + e.getMessage();
+                }
+            }));
+        }
+
+        assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+        fire.countDown();
+        pool.shutdown();
+        assertThat(pool.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+
+        List<String> results = new ArrayList<>();
+        for (Future<String> future : futures) {
+            results.add(future.get());
+        }
+        assertThat(results).as("8 个互不冲突的时段应当全部成交：%s", results).containsOnly("OK");
+
+        // 这条断言钉的是「已约数不能用读-改-写更新」：
+        // 旧实现带 version 条件并重试 5 次，在 MySQL RR 下重试读到的始终是首次快照，
+        // 结果 8 单只有 1 单计入。改成 booked_count = booked_count + 1 后不会再少记。
+        Schedule schedule = scheduleMapper.selectById(scheduleId);
+        assertThat(schedule.getBookedCount()).as("已约数应等于成交单数").isEqualTo(threads);
+    }
+
+    @Test
     @DisplayName("相邻时段互不影响：10:00 被占后 10:30 仍可下单")
     void adjacentSlotStaysAvailableAfterBooking() {
         Long staffId = seedStaff();

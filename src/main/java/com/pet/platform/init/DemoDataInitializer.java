@@ -7,7 +7,7 @@ import com.pet.platform.module.appointment.entity.AppointmentSlot;
 import com.pet.platform.module.appointment.mapper.AppointmentItemMapper;
 import com.pet.platform.module.appointment.mapper.AppointmentMapper;
 import com.pet.platform.module.appointment.mapper.AppointmentSlotMapper;
-import com.pet.platform.module.appointment.service.OrderNoService;
+import com.pet.platform.module.appointment.service.OrderNo;
 import com.pet.platform.module.category.entity.Category;
 import com.pet.platform.module.category.mapper.CategoryMapper;
 import com.pet.platform.module.customer.entity.Customer;
@@ -77,7 +77,6 @@ public class DemoDataInitializer implements CommandLineRunner {
     private final AppointmentSlotMapper appointmentSlotMapper;
     private final ReviewMapper reviewMapper;
     private final PasswordEncoder passwordEncoder;
-    private final OrderNoService orderNoService;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -427,6 +426,11 @@ public class DemoDataInitializer implements CommandLineRunner {
                     appointment.setCreateTime(now.minusMinutes(8));
                 }
                 appointmentMapper.insert(appointment);
+                String orderNo = OrderNo.of(appointment.getAppointmentDate(), appointment.getId());
+                appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
+                        .set(Appointment::getOrderNo, orderNo)
+                        .eq(Appointment::getId, appointment.getId()));
+                appointment.setOrderNo(orderNo);
 
                 insertItems(appointment, item, pkg);
                 insertSlots(appointment, start);
@@ -457,7 +461,6 @@ public class DemoDataInitializer implements CommandLineRunner {
         int duration = pkg == null ? item.getDuration() : 60 * 2;
         BigDecimal amount = pkg == null ? item.getPrice() : pkg.getSellingPrice();
         Appointment appointment = new Appointment();
-        appointment.setOrderNo(orderNoService.next(date));
         appointment.setCustomerId(pet.getCustomerId());
         appointment.setPetId(pet.getId());
         appointment.setStaffId(staff.getId());
