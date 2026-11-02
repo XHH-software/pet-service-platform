@@ -389,13 +389,24 @@ public class AppointmentService {
             throw new BusinessException("该技师当日不可约");
         }
         LocalTime start = request.getStartTime();
+        // 唯一索引 (staff_id, appointment_date, slot_time) 只能拦住「同一格重复插入」，
+        // 拦不住「区间错位重叠」：已占 10:00 这一格时，从 10:20 开始的一单会落到 10:20 格，
+        // 索引放行，但 10:20-10:40 和 10:00-10:30 在时间上重叠了 10 分钟。
+        // 所以「开始时间对齐到 30 分钟」是这套切片方式成立的前提，必须在入口显式校验，
+        // 不能只依赖前端传上来的值恰好落在网格上。
+        if (start.getMinute() % 30 != 0 || start.getSecond() != 0 || start.getNano() != 0) {
+            throw new BusinessException("开始时间需为整点或半点");
+        }
         LocalTime end;
         // 管理端代下单允许手工指定结束时间（日历代客预约表单会传 endTime），
         // 小程序端不传，按所选服务的总时长自动计算。
         if (admin && request.getEndTime() != null && request.getEndTime().isAfter(start)) {
             end = ceilToHalfHour(request.getEndTime());
         } else {
-            end = start.plusMinutes(duration);
+            // 结束时间同样向上取整：时间片按半小时占位，若这里保留 10:45 这样的原始值，
+            // 数据库里就出现「显示 10:45 结束、实际占到 11:00」的错位，客户会问为什么
+            // 10:45 之后的半小时约不上。取整后 end_time 与真实占用严格一致。
+            end = ceilToHalfHour(start.plusMinutes(duration));
         }
         if (start.isBefore(schedule.getStartTime()) || end.isAfter(schedule.getEndTime())) {
             throw new BusinessException("预约时间超出技师排班范围");

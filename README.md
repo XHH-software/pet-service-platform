@@ -97,7 +97,7 @@ pet-service-platform/
 │     ├─ schedule, appointment, review
 │     ├─ shop, dashboard, upload
 ├─ src/test/
-│  ├─ java/com/pet/platform/      # 24 个集成测试（并发 / 限量 / 排班校验 / 降级 / 越权）
+│  ├─ java/com/pet/platform/      # 28 个集成测试（并发 / 限量 / 时间网格 / 排班校验 / 降级 / 越权）
 │  └─ resources/
 │     ├─ application-test.yml     # H2 内存库 + 故意不可用的 Redis
 │     └─ schema-h2.sql            # 与生产 DDL 同构的 H2 版本
@@ -295,8 +295,10 @@ npm run dev:h5 -- --port 8082   # http://localhost:8082（不加参数时默认 
 
 ### 7.3 预约时段冲突 + `schedule.booked_count` 原子自增
 
-- 下单时按 `staffId + date + 时间段` 查询 `appointment_slot`，存在重叠即拒绝，提示“该时段已被预约，请选择其他时间”。
+- 下单时按 `staffId + date + 时间段` 查询 `appointment_slot`，存在重叠即拒绝，提示"该时段已被预约，请选择其他时间"。
 - 真正的正确性来自 `appointment_slot` 上的唯一索引，前面的查询只负责给出友好提示。
+- 时间片按半小时切，所以下单入口强制 `start` 落在整点或半点。这条校验不是洁癖：唯一索引只拦得住"同一格重复插入"，拦不住"区间错位"——已占 `10:00` 这一格时，从 `10:20` 开始的一单会落到 `10:20` 格，索引放行，实际却和 `10:00-10:30` 重叠了 10 分钟。网格对齐是切片方案能成立的前提，不能假设调用方会传对。
+- 结束时间统一向上取整到半小时（45 分钟的服务从 `10:00` 开始，落库是 `10:00-11:00`）。不取整的话库里会出现"显示 `10:45` 结束、实际占到 `11:00`"的错位，客户会问为什么 `10:45` 之后那半小时约不上。
 - 排班表的已约数用**单条原子自增**更新：
 
   ```sql
@@ -403,7 +405,7 @@ appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
 ## 9. 测试与验证
 
 ```bash
-mvn test        # 24 个用例，约 40 秒，不依赖 Docker / MySQL / Redis
+mvn test        # 28 个用例，约 40 秒，不依赖 Docker / MySQL / Redis
 ```
 
 测试直接跑真实 Spring 容器 + 真实 MyBatis-Plus + H2(MODE=MySQL)，**不 mock Mapper**——要验证的正是数据库约束本身。`application-test.yml` 里 Redis 被故意指向 `127.0.0.1:1`，所以每个用例都在「缓存不可用」的真实降级路径上运行。
@@ -418,6 +420,8 @@ mvn test        # 24 个用例，约 40 秒，不依赖 Docker / MySQL / Redis
 | `AppointmentDailyLimitTest` | `rejectsTheFourthBookingAndAcceptsAfterCancel` | 限额 3 的项目第 4 单被拒；取消一单后名额回收、可以再约 |
 | | `concurrentBookingsNeverExceedDailyLimit` | 8 个并发抢 3 个名额，**恰好成交 3 单**，不多不少 |
 | | `unlimitedServiceIsNotCapped` | `daily_limit=0` 不受限，且不写令牌行 |
+| `AppointmentTimeGridTest` | `rejectsStartOffTheHalfHourGrid` / `rejectsStartWithSeconds` | 开始时间必须落在整点或半点：`10:20`、`10:00:30` 一律拒绝且不落库——这类值会插进 `10:20` 这一格，跟已占的 `10:00` 格重叠，而唯一索引拦不住 |
+| | `roundsEndTimeUpToHalfHour` / `shortServiceOccupiesSingleSlot` | 结束时间取整后与真实占用一致：50 分钟的服务占 2 片、`end_time` 落 `11:00`；20 分钟占 1 片、落 `10:30` |
 | `RedisDowntimeTest` | `bookingStillWorksWhenRedisIsDown` | 先断言 Redis 确实连不上，再断言下单照样成功落库 |
 | | `scanFallbackFindsUnpaidAppointmentsWithoutRedis` | ZSet 不可用时，扫表查询仍能找出超时待支付单 |
 | `DualEndAuthTest` | `userTokenCannotCallAdminApi` | 小程序 token 调 `/admin/**` → 401 |
