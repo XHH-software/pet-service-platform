@@ -176,6 +176,9 @@ CREATE TABLE appointment (
   -- 允许为空：订单号由自增主键派生，插入后在同一事务内回填。
   -- 想做到「插入前就知道号」只能读当天最大号，那是读-改-写，并发下必然撞唯一键。
   order_no VARCHAR(20) NULL UNIQUE,
+  -- 下单幂等键：客户端每次进入下单页生成一个 UUID，同一键重复提交只落一单。
+  -- 允许为空（管理端代下单不传），MySQL 的唯一索引里多个 NULL 互不冲突。
+  request_id VARCHAR(64) NULL,
   customer_id BIGINT NOT NULL,
   pet_id BIGINT NOT NULL,
   staff_id BIGINT NOT NULL,
@@ -197,7 +200,8 @@ CREATE TABLE appointment (
   KEY idx_date_staff (appointment_date, staff_id),
   KEY idx_customer (customer_id),
   KEY idx_status (status),
-  KEY idx_create_time (create_time)
+  KEY idx_create_time (create_time),
+  UNIQUE KEY uk_request_id (request_id)
 ) COMMENT '预约';
 
 CREATE TABLE appointment_item (

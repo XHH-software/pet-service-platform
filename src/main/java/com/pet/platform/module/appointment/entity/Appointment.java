@@ -24,6 +24,12 @@ public class Appointment extends BaseEntity {
 
     private String orderNo;
 
+    /**
+     * 下单幂等键，由客户端在下单页生成（UUID）。
+     * 同一键重复提交只会落一单，第二次直接返回首次结果；为空表示不做幂等（如管理端代下单）。
+     */
+    private String requestId;
+
     private Long customerId;
 
     private Long petId;

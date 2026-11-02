@@ -97,7 +97,7 @@ pet-service-platform/
 │     ├─ schedule, appointment, review
 │     ├─ shop, dashboard, upload
 ├─ src/test/
-│  ├─ java/com/pet/platform/      # 28 个集成测试（并发 / 限量 / 时间网格 / 排班校验 / 降级 / 越权）
+│  ├─ java/com/pet/platform/      # 32 个集成测试（并发 / 限量 / 幂等 / 时间网格 / 排班校验 / 降级 / 越权）
 │  └─ resources/
 │     ├─ application-test.yml     # H2 内存库 + 故意不可用的 Redis
 │     └─ schema-h2.sql            # 与生产 DDL 同构的 H2 版本
@@ -266,7 +266,7 @@ npm run dev:h5 -- --port 8082   # http://localhost:8082（不加参数时默认 
 | 套餐 | `GET /user/package/list` | **直接返回数组** |
 | | `GET /user/package/{id}` | 详情，含 `price`（售价）与 `duration`（总时长） |
 | 排班 | `GET /user/schedule/available?date=&serviceItemId=` | 可约员工与时段 |
-| 预约 | `POST /user/appointment` | 下单（`status=1`、`source=1`，写入 Redis 超时 ZSet） |
+| 预约 | `POST /user/appointment` | 下单（`status=1`、`source=1`，写入 Redis 超时 ZSet）；可带 `requestId` 做幂等，重试不会重复下单 |
 | | `GET /user/appointment/page?status=` | 我的预约分页 |
 | | `GET /user/appointment/{id}` | 详情（含 `serviceName`、`timeSlotName`、`hasReview`） |
 | | `POST /user/appointment/{id}/pay` | 支付（演示环境直接置为已支付） |
@@ -383,6 +383,17 @@ appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
 
 唯一性由主键天然保证，**不存在竞态，也就不需要重试**。代价有两条，都写进已知边界：`order_no` 列允许为空（只在同一事务的两条语句之间为空，提交前一定回填）；号段是全局自增、跨天连续，不再每天从 `0001` 开始。
 
+### 7.9 下单幂等（`request_id`）
+
+小程序进下单页时生成一个 UUID 放进 `requestId`，重复提交（手抖连点、超时后前端自动重试）只会落一单，第二次拿到的是首单的订单号。
+
+- `appointment.request_id` 上有唯一索引 `uk_request_id`，允许为空——管理端代下单不传，MySQL 的唯一索引里多个 `NULL` 互不冲突。
+- 拦截顺序有讲究：幂等检查必须排在**时段冲突预检之前**。重复请求要占的时段已经被首单占了，如果先做预检，第二次提交拿到的是"该时段已被预约"，客户会以为第一次没成功，换个时段又下一单。
+- 并发下两个相同 `requestId` 会同时通过预查，后到的在唯一索引上冲突。这时回查必须用 `select ... for update`：RR 隔离级别下本事务的一致性快照看不到对方刚提交的行，普通 `select` 查到空，会把"重复提交"误判成"下单失败"。这和 7.3 里乐观锁重试空转是同一个根因。
+- 命中时返回首单的 `{id, orderNo}`，附带 `duplicated: true`，前端据此跳过"下单成功"提示。
+
+没有用"业务指纹"去重（同样的客户 + 宠物 + 技师 + 时段就算重复）：用户取消后重新预约同一时段是合法操作，指纹会把它误判成重复。幂等键由客户端控制生命周期，语义更干净，代价是多一个字段和前端一行的 `uuid()`。
+
 ---
 
 ## 8. 关键设计决策
@@ -399,13 +410,14 @@ appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
 | 订单号由自增主键派生，而不是读当天最大号 | 读-改-写在并发下必然取到重号，重试也救不回来 | `order_no` 允许为空（事务内短暂），号段跨天连续 |
 | 已约数用 `booked_count = booked_count + 1` | 自增本身原子，不需要乐观锁；带 `version` 重试在 RR 下是空转 | 无法感知“这一行被谁改过”，但该字段只用于展示 |
 | 集成测试用 H2 而不是 Testcontainers | clone 下来 `mvn test` 就能跑，不需要装 Docker | H2 与 MySQL 有方言差异，需要单独维护一份同构 DDL |
+| 幂等用客户端 `request_id` + 唯一索引，而不是"最近 N 分钟内同客户同宠物同技师"的业务指纹 | 指纹会把"取消后重新预约同一时段"误判成重复，而那是个合法操作 | 前端要多生成一个 UUID；不传就退化成没有幂等 |
 
 ---
 
 ## 9. 测试与验证
 
 ```bash
-mvn test        # 28 个用例，约 40 秒，不依赖 Docker / MySQL / Redis
+mvn test        # 32 个用例，约 40 秒，不依赖 Docker / MySQL / Redis
 ```
 
 测试直接跑真实 Spring 容器 + 真实 MyBatis-Plus + H2(MODE=MySQL)，**不 mock Mapper**——要验证的正是数据库约束本身。`application-test.yml` 里 Redis 被故意指向 `127.0.0.1:1`，所以每个用例都在「缓存不可用」的真实降级路径上运行。
@@ -420,6 +432,10 @@ mvn test        # 28 个用例，约 40 秒，不依赖 Docker / MySQL / Redis
 | `AppointmentDailyLimitTest` | `rejectsTheFourthBookingAndAcceptsAfterCancel` | 限额 3 的项目第 4 单被拒；取消一单后名额回收、可以再约 |
 | | `concurrentBookingsNeverExceedDailyLimit` | 8 个并发抢 3 个名额，**恰好成交 3 单**，不多不少 |
 | | `unlimitedServiceIsNotCapped` | `daily_limit=0` 不受限，且不写令牌行 |
+| `AppointmentIdempotencyTest` | `sameRequestIdReturnsTheSameOrder` | 同一 `requestId` 提交两次只落 1 单，第二次返回首单的号并带 `duplicated=true`，时间片也只占一次 |
+| | `concurrentSameRequestIdYieldsSingleOrder` | 8 个相同 `requestId` 并发提交：库里只有 1 单，且 8 个请求全部拿到同一个订单 id（钉住"冲突后要用当前读回查"） |
+| | `withoutRequestIdRepeatedBookingsStillWork` | 不传 `requestId` 时保持原行为，不同时段各下一单（多个 `NULL` 不冲突） |
+| | `requestIdOfAnotherCustomerIsRejected` | 拿别人的 `requestId` 提交被拒，不会把对方订单泄露出来 |
 | `AppointmentTimeGridTest` | `rejectsStartOffTheHalfHourGrid` / `rejectsStartWithSeconds` | 开始时间必须落在整点或半点：`10:20`、`10:00:30` 一律拒绝且不落库——这类值会插进 `10:20` 这一格，跟已占的 `10:00` 格重叠，而唯一索引拦不住 |
 | | `roundsEndTimeUpToHalfHour` / `shortServiceOccupiesSingleSlot` | 结束时间取整后与真实占用一致：50 分钟的服务占 2 片、`end_time` 落 `11:00`；20 分钟占 1 片、落 `10:30` |
 | `RedisDowntimeTest` | `bookingStillWorksWhenRedisIsDown` | 先断言 Redis 确实连不上，再断言下单照样成功落库 |
@@ -484,8 +500,18 @@ app.cors.allowed-origins: '*'  # 逗号分隔的来源白名单，* 表示不限
 6. **每日名额只对下单生效**。启动器播种的历史订单是直接 insert 的，不会写入名额令牌，因此演示数据里“今天的已约数”不占当日名额。
 7. **疫苗过期拦截**。演示数据中 `雪球` 疫苗已过期，下单会被拒绝，这是预期业务校验。
 8. **上传文件保存在本地 `./uploads`**，通过 `/uploads/**` 静态访问；生产建议切 OSS 或对象存储。
-9. **订单号是“日期 + 自增主键”，号段跨天连续**，不再是每天从 0001 开始（换来的是零竞态，见 7.8）。已有库升级需执行 `ALTER TABLE appointment MODIFY order_no VARCHAR(20) NULL;`。
-10. 管理端列表手机号脱敏（`138****1234`），详情接口返回完整号码。
+9. **订单号是“日期 + 自增主键”，号段跨天连续**，不再是每天从 0001 开始（换来的是零竞态，见 7.8）。
+10. **幂等键是可选的**。不传 `requestId` 时下单行为与之前完全一致，也就没有防重复提交。小程序端建议每次进下单页生成一个 UUID。
+11. 管理端列表手机号脱敏（`138****1234`），详情接口返回完整号码。
+
+已有库升级（订单号列 + 幂等键）需执行：
+
+```sql
+ALTER TABLE appointment MODIFY order_no VARCHAR(20) NULL;
+ALTER TABLE appointment
+  ADD COLUMN request_id VARCHAR(64) NULL,
+  ADD UNIQUE KEY uk_request_id (request_id);
+```
 
 ---
 

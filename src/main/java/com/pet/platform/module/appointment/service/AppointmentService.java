@@ -51,6 +51,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -315,6 +316,24 @@ public class AppointmentService {
             throw new BusinessException("请选择开始时间");
         }
 
+        // 幂等：客户端每次进下单页生成一个 requestId，手抖连点或超时重试都带同一个值，
+        // 同一键只会落一单。这里先查一次是快路径；并发下两个请求都可能查不到，
+        // 真正的兜底是 uk_request_id 唯一索引（见下面的 insert）。
+        // 位置必须在时段冲突预检之前——重复请求要占的时段已经被首单占了，
+        // 若先做预检，第二次提交拿到的是"该时段已被预约"，而不是首单的结果。
+        if (StringUtils.hasText(request.getRequestId())) {
+            if (request.getRequestId().length() > 64) {
+                throw new BusinessException("请求标识过长");
+            }
+            Appointment sameRequest = findByIdempotencyKey(request.getRequestId(), false);
+            if (sameRequest != null) {
+                if (!Objects.equals(sameRequest.getCustomerId(), customerId)) {
+                    throw new BusinessException("请求参数非法");
+                }
+                return idempotentResult(sameRequest);
+            }
+        }
+
         int petSize = petSize(pet.getWeight());
         List<AppointmentItem> items = new ArrayList<>();
         List<QuotaTarget> quotas = new ArrayList<>();
@@ -440,7 +459,20 @@ public class AppointmentService {
         // order_no 由自增主键派生：先插入拿到 id，再在同一事务里回填，
         // 不再「读当天最大号 + 1」——那是读-改-写，并发下必然取到同一个号。
         appointment.setOrderNo(null);
-        appointmentMapper.insert(appointment);
+        try {
+            appointmentMapper.insert(appointment);
+        } catch (DuplicateKeyException e) {
+            // 并发下两个相同 requestId 的请求同时通过了上面的预查，后到的会撞 uk_request_id。
+            // 回查必须用当前读（for update）：RR 隔离级别下本事务的一致性快照看不到
+            // 对方刚提交的那一行，普通 select 会查空，把"重复提交"误判成"下单失败"。
+            // （order_no 插入时为 NULL，多个 NULL 不冲突，所以这里只可能是幂等键重复。）
+            Appointment sameRequest = StringUtils.hasText(request.getRequestId())
+                    ? findByIdempotencyKey(request.getRequestId(), true) : null;
+            if (sameRequest != null && Objects.equals(sameRequest.getCustomerId(), customerId)) {
+                return idempotentResult(sameRequest);
+            }
+            throw e;
+        }
         String orderNo = OrderNo.of(date, appointment.getId());
         appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
                 .set(Appointment::getOrderNo, orderNo)
@@ -476,6 +508,31 @@ public class AppointmentService {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id", appointment.getId());
         result.put("orderNo", appointment.getOrderNo());
+        return result;
+    }
+
+    /**
+     * 按幂等键查已落库的订单。
+     *
+     * <p>{@code currentRead = true} 时加 {@code for update} 走当前读，用于唯一索引冲突后的回查。
+     * 不能省这一步：MySQL 默认 REPEATABLE_READ 下，同一事务内的一致性读共用首次快照，
+     * 冲突后重新 select 读到的仍是本事务开始时的版本，看不到对方刚提交的行。
+     */
+    private Appointment findByIdempotencyKey(String requestId, boolean currentRead) {
+        LambdaQueryWrapper<Appointment> query = Wrappers.<Appointment>lambdaQuery()
+                .eq(Appointment::getRequestId, requestId);
+        if (currentRead) {
+            query.last("for update");
+        }
+        return appointmentMapper.selectOne(query);
+    }
+
+    /** 幂等命中：返回与首次一致的结果，额外给一个 duplicated 标记让前端跳过"下单成功"提示 */
+    private Map<String, Object> idempotentResult(Appointment existing) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("id", existing.getId());
+        result.put("orderNo", existing.getOrderNo());
+        result.put("duplicated", true);
         return result;
     }
 
