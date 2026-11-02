@@ -1,0 +1,81 @@
+# 一键起 MySQL + Redis + 应用
+#   docker compose up -d --build
+#   docker compose logs -f app
+#
+# 想清空数据重来（会重新执行 sql/schema.sql 播种）：
+#   docker compose down -v
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: pet-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: pet_service_platform
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      # 首次启动时自动建库建表
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # 用 mysqladmin 探活，避免应用先于数据库就绪而启动失败
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: pet-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pet-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:mysql://mysql:3306/pet_service_platform?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # 生产部署务必在 .env 里换成随机长串
+      JWT_SECRET: ${JWT_SECRET:-please-change-this-to-a-32-byte-random-string}
+      UPLOAD_TYPE: ${UPLOAD_TYPE:-local}
+      UPLOAD_DIR: /app/uploads
+      UPLOAD_BASE_URL: ${UPLOAD_BASE_URL:-http://localhost:8080}
+      ORDER_TIMEOUT_MINUTES: ${ORDER_TIMEOUT_MINUTES:-30}
+      TZ: Asia/Shanghai
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - uploads:/app/uploads
+
+volumes:
+  mysql-data:
+  redis-data:
+  uploads:

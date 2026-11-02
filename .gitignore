@@ -8,3 +8,4 @@ backend.log
 .token
 .utoken
 testout/
+.env

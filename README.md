@@ -1,11 +1,58 @@
 # pet-service-platform
 
+![Java](https://img.shields.io/badge/Java-11-orange)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-2.7.18-6DB33F)
+![MySQL](https://img.shields.io/badge/MySQL-8.x-4479A1)
+![Redis](https://img.shields.io/badge/Redis-5.x%20%2F%207.x-DC382D)
+[![CI](https://github.com/XHH-software/pet-service-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/XHH-software/pet-service-platform/actions/workflows/ci.yml)
+![License](https://img.shields.io/badge/License-MIT-blue)
+
 宠物服务预约平台后端（Spring Boot + MyBatis-Plus + MySQL + Redis + JWT），同时为两个真实前端提供接口：
 
 - 商家管理端：[pet-web-admin-kit](https://github.com/XHH-software/pet-web-admin-kit)（Vue 3 + Element Plus + Vite，默认 8081）
 - 小程序端：[pet-wx-users-kit](https://github.com/XHH-software/pet-wx-users-kit)（uni-app，H5 调试常用 8082）
 
 后端按前端现有调用契约实现，不是空壳或 mock 数据，所有列表、详情、下单、支付、核销、排班、CRUD、上传接口均可直接联调。
+
+**这个项目想解决的真正问题不是 CRUD，而是「时间」这种资源的并发分配**：一个技师在同一个 30 分钟里只能服务一只宠物，缓存挂了订单也得能下，名额限量不能因为并发而多卖。下面第 7、8 章都是在讲这三件事怎么落地。
+
+```mermaid
+flowchart LR
+    A["商家管理端<br/>Vue3 + Element Plus"] -->|"token 头"| GW
+    B["小程序端<br/>uni-app"] -->|"authentication 头"| GW
+
+    subgraph GW["Spring Boot 2.7 · JDK 11"]
+        direction TB
+        I1["AdminAuthInterceptor<br/>只认 type=admin"]
+        I2["UserAuthInterceptor<br/>只认 type=user"]
+        D1["预约域<br/>时间片 · 名额令牌 · 状态机"]
+        D2["基础域<br/>员工 · 客户 · 宠物 · 服务"]
+        T["AppointmentTimeoutTask<br/>ZSet 为主 + 扫表兜底"]
+        I1 --> D1
+        I2 --> D1
+        I1 --> D2
+        T --> D1
+    end
+
+    GW --> M[("MySQL 8<br/>17 张表")]
+    GW --> R[("Redis<br/>token 黑名单 · 超时 ZSet")]
+```
+
+---
+
+## 0. 快速开始（Docker，推荐）
+
+装好 Docker Desktop 后，三条命令起完整环境（MySQL + Redis + 应用，自动建表 + 播种演示数据）：
+
+```bash
+cp .env.example .env          # 按需改端口/密码；JWT_SECRET 记得换
+docker compose up -d --build
+docker compose logs -f app    # 看到 Started PetServicePlatformApplication 即就绪
+```
+
+访问 `http://localhost:8080`，用下面的演示账号直接登录。想清空数据重来：`docker compose down -v`。
+
+> 不想用 Docker 的，看第 3 章的手动启动方式，逻辑完全一样。
 
 ---
 
@@ -29,7 +76,10 @@
 
 ```
 pet-service-platform/
-├─ sql/schema.sql                 # 16 张表 DDL + 演示数据由启动器播种
+├─ Dockerfile                     # 多阶段构建：maven 打包 → JRE11 运行
+├─ docker-compose.yml             # MySQL + Redis + 应用，一条命令起全套
+├─ .env.example                   # 端口 / 密码 / JWT_SECRET 等环境变量模板
+├─ sql/schema.sql                 # 17 张表 DDL（含名额令牌表），演示数据由启动器播种
 ├─ src/main/java/com/pet/platform/
 │  ├─ common/                     # Result / PageResult / UserContext / @AutoFill + AOP
 │  ├─ config/                     # WebConfig（拦截器、CORS、静态资源）、MyBatis-Plus、Jackson
@@ -42,6 +92,11 @@ pet-service-platform/
 │     ├─ service（服务项目 / 套餐 / 分类）
 │     ├─ schedule, appointment, review
 │     ├─ shop, dashboard, upload
+├─ src/test/
+│  ├─ java/com/pet/platform/      # 14 个集成测试（并发 / 限量 / 降级 / 越权）
+│  └─ resources/
+│     ├─ application-test.yml     # H2 内存库 + 故意不可用的 Redis
+│     └─ schema-h2.sql            # 与生产 DDL 同构的 H2 版本
 ├─ src/main/resources/application.yml
 └─ pom.xml
 ```
@@ -51,6 +106,8 @@ pet-service-platform/
 ## 3. 环境与启动
 
 ### 3.1 前置依赖
+
+> 已有 Docker 的话可以直接跳到第 0 章，无需在本机装 MySQL / Redis。
 
 1. MySQL 8 运行在 `localhost:3306`，账号 `root / root`
 2. Redis 运行在 `localhost:6379`
@@ -269,7 +326,96 @@ npm run dev:h5 -- --port 8082   # http://localhost:8082（不加参数时默认 
 
 ---
 
-## 8. 配置说明
+### 7.7 每日名额（`daily_limit`）
+
+`service_item.daily_limit` / `service_package.daily_limit` 表示「该服务每天最多接几单」。最常见的写法是「先 count 当天订单数，再判断是否超额」——**这是典型的 TOCTOU**：两个请求同时 count 到 9（上限 10），就会一起写进去 11 单。
+
+本项目的做法是**把名额变成一行可以被唯一索引抢的令牌**：
+
+```sql
+CREATE TABLE service_daily_quota (
+  quota_date DATE NOT NULL,
+  service_item_id BIGINT,      -- 与 package_id 二选一
+  package_id BIGINT,
+  seq INT NOT NULL,            -- 当天第几个名额，1..daily_limit
+  appointment_id BIGINT NOT NULL,
+  UNIQUE KEY uk_item_date_seq (service_item_id, quota_date, seq),
+  UNIQUE KEY uk_package_date_seq (package_id, quota_date, seq)
+);
+```
+
+下单时按 `seq = 1..limit` 逐个尝试插入，插入成功即占到名额，`DuplicateKeyException` 说明该序号被抢了就顺延；全部序号都被占满 → 当日名额用完（`AppointmentService#reserveDailyQuota`）。
+
+- **没有先查后写的时间窗**：判断和占位是同一条 INSERT。
+- **不会与真实订单漂移**：订单回滚，令牌行跟着回滚；取消订单时按 `appointment_id` 整批删除（`releaseDailyQuota`）。
+- **不用 Redis 计数器**：计数器丢 key 或事务回滚会永久性多卖/少卖，而数据库行和订单在同一个事务里。
+
+`daily_limit = 0` 或 `NULL` 视为不限量，直接跳过令牌写入。
+
+### 7.8 订单号在并发下的唯一性
+
+`OrderNoService.next()` 是「查当天最大号 + 1」，即使加了 `synchronized` 也只能保证同一 JVM 内串行——**前一个事务还没提交时，后一个线程查不到它刚插入的行**，于是生成同一个号，撞上 `order_no` 的唯一索引。
+
+处理方式不是把异常抛给用户，而是在写库处做「重取号 + 重试」（`AppointmentService#insertAppointment`）：
+
+```java
+for (int attempt = 1; ; attempt++) {
+    try { appointmentMapper.insert(appointment); return; }
+    catch (DuplicateKeyException e) {          // appointment 表上只有 order_no 一个唯一键
+        if (attempt >= 3) throw new BusinessException("下单人数较多，请稍后重试");
+        appointment.setId(null);
+        appointment.setOrderNo(orderNoService.next(appointment.getAppointmentDate()));
+    }
+}
+```
+
+代价是极端并发下订单号可能不连续（`...0003` 后面直接 `...0005`），这在预约单场景可以接受。
+
+---
+
+## 8. 关键设计决策
+
+几个决定项目形态的选择，以及当时的取舍：
+
+| 决策 | 为什么这么做 | 代价 / 边界 |
+| --- | --- | --- |
+| 时间按 30 分钟切片，单独建 `appointment_slot` 表 | 时间区间本身无法加唯一约束，切成离散块之后才能让数据库来兜底并发 | 服务时长必须是 30 的整数倍；跨片服务要占多行 |
+| 冲突校验「查一次 + 唯一索引兜底」两层 | 查一次是为了给出友好提示，唯一索引才是正确性的保证 | 提示信息需要区分两种失败来源 |
+| Redis 只做加速，不做事实来源 | 缓存一定会挂；订单是钱，不能因为缓存挂了就下不了单 | 缓存不可用时关单会延迟最多 5 分钟（扫表周期） |
+| 管理端与小程序各一套 token 与拦截器 | 一个 token 走天下时，用户 token 能直接调管理端接口 | 多一个 `type` 字段的校验成本 |
+| 名额用令牌表而不是计数器 | 令牌与订单同事务，天然不会漂移 | 多一张表，取消时要显式回收 |
+| 集成测试用 H2 而不是 Testcontainers | clone 下来 `mvn test` 就能跑，不需要装 Docker | H2 与 MySQL 有方言差异，需要单独维护一份同构 DDL |
+
+---
+
+## 9. 测试与验证
+
+```bash
+mvn test        # 14 个用例，约 25 秒，不依赖 Docker / MySQL / Redis
+```
+
+测试直接跑真实 Spring 容器 + 真实 MyBatis-Plus + H2(MODE=MySQL)，**不 mock Mapper**——要验证的正是数据库约束本身。`application-test.yml` 里 Redis 被故意指向 `127.0.0.1:1`，所以每个用例都在「缓存不可用」的真实降级路径上运行。
+
+| 测试类 | 用例 | 验证什么 |
+| --- | --- | --- |
+| `AppointmentConcurrencyTest` | `onlyOneBookingWinsForTheSameSlot` | 16 线程抢同一技师同一时段，**只有 1 单成功**，时间片只留 2 行，`booked_count` 只 +1 |
+| | `adjacentSlotStaysAvailableAfterBooking` | 10:00 被占后 10:30 仍可下单，切片之间不误伤 |
+| | `longServiceBlocksEverySlotItCovers` | 60 分钟服务会把 10:30 这个起点一起占掉 |
+| | `cancelReleasesSlots` | 取消后时间片释放，同一时段可被重新预订 |
+| `AppointmentDailyLimitTest` | `rejectsTheFourthBookingAndAcceptsAfterCancel` | 限额 3 的项目第 4 单被拒；取消一单后名额回收、可以再约 |
+| | `concurrentBookingsNeverExceedDailyLimit` | 8 个并发抢 3 个名额，**恰好成交 3 单**，不多不少 |
+| | `unlimitedServiceIsNotCapped` | `daily_limit=0` 不受限，且不写令牌行 |
+| `RedisDowntimeTest` | `bookingStillWorksWhenRedisIsDown` | 先断言 Redis 确实连不上，再断言下单照样成功落库 |
+| | `scanFallbackFindsUnpaidAppointmentsWithoutRedis` | ZSet 不可用时，扫表查询仍能找出超时待支付单 |
+| `DualEndAuthTest` | `userTokenCannotCallAdminApi` | 小程序 token 调 `/admin/**` → 401 |
+| | `adminTokenCannotCallUserApi` | 管理端 token 调 `/user/**` → 401 |
+| | `missingTokenIsRejectedAndValidTokenPasses` | 无 token 拒绝、正确 token 放行 |
+| | `bearerHeaderIsAlsoAccepted` | `Authorization: Bearer` 兼容 |
+| | `tamperedTokenIsRejected` | 篡改签名 / 乱写 token 一律 401 |
+
+---
+
+## 10. 配置说明
 
 `src/main/resources/application.yml`：
 
@@ -289,22 +435,37 @@ app.order.timeout-minutes: 30
 
 切换到 OSS：把 `app.upload.type` 改为 `oss`，并填写 `app.upload.oss.*` 的 endpoint/bucket/AK/SK。
 
+所有配置都支持环境变量覆盖，容器化部署时只需注入环境变量（模板见 `.env.example`）：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SERVER_PORT` | `8080` | 服务端口 |
+| `DB_URL` | `jdbc:mysql://localhost:3306/pet_service_platform...` | 数据库连接 |
+| `DB_USERNAME` / `DB_PASSWORD` | `root` / `root` | 数据库账号 |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis 地址 |
+| `JWT_SECRET` | 仓库内的占位值 | **生产必须替换**，建议 `openssl rand -base64 32` |
+| `UPLOAD_TYPE` / `UPLOAD_DIR` | `local` / `./uploads` | 存储方式与目录 |
+| `WX_MOCK` | `true` | 关掉才会走真实微信登录 |
+| `ORDER_TIMEOUT_MINUTES` | `30` | 未支付自动关单时长 |
+
 ---
 
-## 9. 已知边界（如实说明）
+## 11. 已知边界（如实说明）
 
-1. **没有购物车、没有商品库存扣减**。本项目是“服务预约”业务，不是电商；核心并发控制是“时段冲突校验 + `schedule.booked_count` 乐观锁”，不是商品库存防超卖。
-2. **微信登录是开发期 mock**。`app.wx.mock=true` 时任意 code 都映射到 `mock_openid_dev`（张女士）；接入真实小程序需配置 `app.wx.app-id/app-secret` 并关闭 mock。
+1. **没有购物车、没有商品库存扣减**。本项目是“服务预约”业务，不是电商；核心并发控制是“时段冲突校验 + `schedule.booked_count` 乐观锁 + 名额令牌”，不是商品库存防超卖。
+2. **微信登录是开发期 mock**。`app.wx.mock=true` 时任意 code 都映射到 `mock_openid_dev`（张女士）。**部署到公网前必须配置 `app.wx.app-id/app-secret` 并把 `WX_MOCK` 设为 false，同时替换 `JWT_SECRET`**——否则任何人都能登进演示账号。
 3. **支付是演示实现**。`/user/appointment/{id}/pay` 直接把订单置为已支付，未接微信支付。
 4. **单门店**。`shop` 表只有一条记录，未做多租户/多门店隔离。
 5. **小程序代下单页忽略 `packageId`**。前端 `appointment/create` 只处理 `serviceItemId`，套餐预约目前仅后端接口支持，属前端缺口。
-6. **疫苗过期拦截**。演示数据中 `雪球` 疫苗已过期，下单会被拒绝，这是预期业务校验。
-7. **上传文件保存在本地 `./uploads`**，通过 `/uploads/**` 静态访问；生产建议切 OSS 或对象存储。
-8. 管理端列表手机号脱敏（`138****1234`），详情接口返回完整号码。
+6. **每日名额只对下单生效**。启动器播种的历史订单是直接 insert 的，不会写入名额令牌，因此演示数据里“今天的已约数”不占当日名额。
+7. **疫苗过期拦截**。演示数据中 `雪球` 疫苗已过期，下单会被拒绝，这是预期业务校验。
+8. **上传文件保存在本地 `./uploads`**，通过 `/uploads/**` 静态访问；生产建议切 OSS 或对象存储。
+9. **订单号在极端并发下可能不连续**（靠重试换来唯一性，见 7.8）。
+10. 管理端列表手机号脱敏（`138****1234`），详情接口返回完整号码。
 
 ---
 
-## 10. 快速自测
+## 12. 快速自测
 
 ```bash
 # 管理端登录
