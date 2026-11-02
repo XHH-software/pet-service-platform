@@ -7,17 +7,18 @@
 [![CI](https://github.com/XHH-software/pet-service-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/XHH-software/pet-service-platform/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-宠物服务预约平台后端（Spring Boot + MyBatis-Plus + MySQL + Redis + JWT），同时为两个真实前端提供接口：
+宠物服务预约平台后端（Spring Boot + MyBatis-Plus + MySQL + Redis + JWT），同时供两个前端调用：
 
 - 商家管理端：[pet-web-admin-kit](https://github.com/XHH-software/pet-web-admin-kit)（Vue 3 + Element Plus + Vite，默认 8081）
 - 小程序端：[pet-wx-users-kit](https://github.com/XHH-software/pet-wx-users-kit)（uni-app，H5 调试常用 8082）
 
-后端按前端现有调用契约实现，不是空壳或 mock 数据，所有列表、详情、下单、支付、核销、排班、CRUD、上传接口均可直接联调。
+接口是按这两个前端已经写好的调用契约反推实现的，不是空壳也不是写死的 mock：列表、详情、下单、支付、核销、排班、CRUD、上传都能直接联调。
 
-**这个项目想解决的真正问题不是 CRUD，而是「时间」这种资源的并发分配**：一个技师在同一个 30 分钟里只能服务一只宠物，缓存挂了订单也得能下，名额限量不能因为并发而多卖。下面第 7、8 章都是在讲这三件事怎么落地。
+一开始只想把接口补齐，做下去发现麻烦的地方不在 CRUD，而在同一份资源被并发抢：一个技师同一个 30 分钟里只能接一只宠物，限量服务不能卖超，没付款的单不能一直挂着。
 
-> 想先看全景而不是逐步读代码：[docs/项目梳理.md](docs/项目梳理.md) —— 数据模型、下单 18 步、四道并发防线、状态机、接口地图、技术债，一页看完。
-> 简历描述与面试问答准备：[docs/简历与面试.md](docs/简历与面试.md) —— 技术栈、五个亮点、30 个可能被追问的问题与答法。
+这几块占的时间最多。做法和踩过的坑记在第 7 章，几个当时只能这么定的选择放在第 8 章，没做完的部分在第 11 章。
+
+> 想先了解全貌：[docs/项目梳理.md](docs/项目梳理.md) —— 数据模型、下单流程、状态机、接口清单、技术债。
 
 ```mermaid
 flowchart LR
@@ -334,9 +335,11 @@ npm run dev:h5 -- --port 8082   # http://localhost:8082（不加参数时默认 
 
 ### 7.7 每日名额（`daily_limit`）
 
-`service_item.daily_limit` / `service_package.daily_limit` 表示「该服务每天最多接几单」。最常见的写法是「先 count 当天订单数，再判断是否超额」——**这是典型的 TOCTOU**：两个请求同时 count 到 9（上限 10），就会一起写进去 11 单。
+`service_item.daily_limit` / `service_package.daily_limit` 是「该服务每天最多接几单」。
 
-本项目的做法是**把名额变成一行可以被唯一索引抢的令牌**：
+最省事的做法是下单前 count 一下当天订单数，没超就往下走。问题在两个请求同时 count 到 9（上限 10）时，都会判断「还能接」，然后一起写进去 11 单——判断和写入之间那个时间窗，靠应用层关不掉。
+
+所以这里把名额做成一行可以被抢的令牌：
 
 ```sql
 CREATE TABLE service_daily_quota (
@@ -360,11 +363,11 @@ CREATE TABLE service_daily_quota (
 
 ### 7.8 订单号：从「读最大号 + 1」改成「按主键派生」
 
-这一节记录了三版实现，因为它是一个很典型的「看起来能跑，并发下必崩」的例子。
+这一节写得长一点，因为三版实现都留着，能看出问题是从哪冒出来的——它符合「看着能跑、并发下必崩」的样子。
 
 **第一版：`synchronized` + 查当天最大号 + 1。** 单机内串行，看似安全。但锁只护住了「读号 + 插入」这一小段，事务提交在锁外——**前一个事务还没提交时，后一个线程查不到它刚插入的行**，于是生成同一个号，撞上 `order_no` 唯一索引。
 
-**第二版：冲突后重取号重试 3 次。** 把 `DuplicateKeyException` 从「抛给用户」改成「换个号再试」。但重试时其他并发事务同样没提交，读到的最大号还是同一个，于是又撞。压测结果：**8 个互不冲突的时段并发下单，5 个报「下单人数较多」**——不是时段冲突，全是订单号冲突。这个用例现在还留在 `AppointmentConcurrencyTest` 里。
+**第二版：冲突后重取号重试 3 次。** 把 `DuplicateKeyException` 从「抛给用户」改成「换个号再试」。但重试时其他并发事务同样没提交，读到的最大号还是同一个，于是又撞。并发用例的结果：**8 个互不冲突的时段同时下单，5 个报「下单人数较多」**——不是时段冲突，全是订单号冲突。这个用例现在还留在 `AppointmentConcurrencyTest` 里。
 
 **最终版：订单号由自增主键派生，插入后在同一事务里回填。**
 
@@ -382,7 +385,7 @@ appointmentMapper.update(null, Wrappers.<Appointment>lambdaUpdate()
 
 ## 8. 关键设计决策
 
-几个决定项目形态的选择，以及当时的取舍：
+当时做选择时的记录，代价写在第三列：
 
 | 决策 | 为什么这么做 | 代价 / 边界 |
 | --- | --- | --- |
@@ -467,9 +470,9 @@ app.cors.allowed-origins: '*'  # 逗号分隔的来源白名单，* 表示不限
 
 ---
 
-## 11. 已知边界（如实说明）
+## 11. 已知边界与没做的部分
 
-1. **没有购物车、没有商品库存扣减**。本项目是“服务预约”业务，不是电商；核心并发控制是“时段冲突校验 + 唯一索引兜底 + 名额令牌”，不是商品库存防超卖。
+1. **没有购物车、没有商品库存扣减**。这个项目是服务预约业务，不是电商；并发控制做的是「时段冲突校验 + 唯一索引兜底 + 名额令牌」，跟商品库存防超卖不是一回事。
 2. **微信登录是开发期 mock**。`app.wx.mock=true` 时任意 code 都映射到 `mock_openid_dev`（张女士）。**部署到公网前必须配置 `app.wx.app-id/app-secret` 并把 `WX_MOCK` 设为 false，同时替换 `JWT_SECRET`**——否则任何人都能登进演示账号。
 3. **支付是演示实现**。`/user/appointment/{id}/pay` 直接把订单置为已支付，未接微信支付。
 4. **单门店**。`shop` 表只有一条记录，未做多租户/多门店隔离。
